@@ -1,287 +1,94 @@
-/**
- * FOR YOU Store — native Node.js starter
- * Node 18+ recommended. No external npm dependencies.
- */
 'use strict';
-const http = require('http');
-const fs = require('fs');
-const path = require('path');
-const crypto = require('crypto');
-const { URL } = require('url');
+// خادم FOR YOU — بدون أي اعتماديات (Node المدمج فقط).
+// يقدّم الواجهة ويحفظ صفحات الإهداء الإلكتروني حتى تفتح من أي جهاز.
+const http = require('http'), fs = require('fs'), path = require('path'), zlib = require('zlib'), crypto = require('crypto');
+const PORT = process.env.PORT || 3000;
+const PUBLISH_KEY = process.env.PUBLISH_KEY || '';
+const DATA_DIR = process.env.DATA_DIR || process.env.RAILWAY_VOLUME_MOUNT_PATH || path.join(__dirname, 'data');
+const PUB = path.join(__dirname, 'public');
+const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json; charset=utf-8', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.svg': 'image/svg+xml', '.ico': 'image/x-icon', '.txt': 'text/plain; charset=utf-8' };
+const CSP = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data: blob: https:; media-src 'self' data: blob: https:; frame-src https://www.youtube-nocookie.com; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'";
 
-const PORT = Number(process.env.PORT || 3000);
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'DATA');
-const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
-const DB_FILE = path.join(DATA_DIR, 'store.json');
-const SESSION_TTL = 7 * 24 * 60 * 60 * 1000;
-const COOKIE = 'foryou_session';
-const MAX_BODY = 8 * 1024 * 1024;
-const rateMap = new Map();
+/* ---------- تخزين الإهداءات (ملف JSON) ---------- */
+let store = {}, FILE = path.join(DATA_DIR, 'greetings.json'), persistent = true;
+try { fs.mkdirSync(DATA_DIR, { recursive: true }); store = JSON.parse(fs.readFileSync(FILE, 'utf8')); } catch (e) { if (e.code !== 'ENOENT') { try { fs.accessSync(DATA_DIR, fs.constants.W_OK); } catch (x) { persistent = false; console.warn('DATA_DIR غير قابل للكتابة: الإهداءات بالذاكرة فقط'); } } }
+let wt = null;
+function save() { clearTimeout(wt); wt = setTimeout(() => { if (!persistent) return; const tmp = FILE + '.tmp'; try { fs.writeFileSync(tmp, JSON.stringify(store)); fs.renameSync(tmp, FILE); } catch (e) { console.error('save failed', e.message); } }, 200); }
 
-for (const d of [DATA_DIR, UPLOAD_DIR]) fs.mkdirSync(d, { recursive: true });
+/* ---------- أدوات ---------- */
+const hits = new Map();
+function limited(ip, key, max) { const k = key + ip, n = Date.now(), a = (hits.get(k) || []).filter(t => n - t < 60000); a.push(n); hits.set(k, a); if (hits.size > 5000) hits.clear(); return a.length > max; }
+const sha = s => crypto.createHash('sha256').update(String(s)).digest();
+const authed = req => PUBLISH_KEY && crypto.timingSafeEqual(sha(req.headers['x-publish-key'] || ''), sha(PUBLISH_KEY));
+function send(res, code, body, headers) { const h = Object.assign({ 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'same-origin', 'X-Frame-Options': 'DENY' }, headers || {}); if (typeof body === 'object' && !Buffer.isBuffer(body)) { body = JSON.stringify(body); h['Content-Type'] = 'application/json; charset=utf-8'; h['Cache-Control'] = 'no-store'; } res.writeHead(code, h); res.end(body); }
+function readBody(req, max) { return new Promise((ok, no) => { let n = 0, bad = false; const c = []; req.on('data', d => { n += d.length; if (bad) return; if (n > max) { bad = true; no(Object.assign(new Error('big'), { code: 413 })); } else c.push(d); }); req.on('end', () => { if (!bad) ok(Buffer.concat(c).toString('utf8')); }); req.on('error', no); }); }
+const THEMES = ['rose', 'gold', 'night', 'lilac', 'peach'];
+const str = (v, n) => typeof v === 'string' ? v.slice(0, n) : '';
+function clean(d) {
+  if (!d || typeof d !== 'object') return null;
+  const imgs = Array.isArray(d.imgs) ? d.imgs.slice(0, 8).filter(s => typeof s === 'string' && /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(s) && s.length < 900000) : [];
+  const url = u => /^https?:\/\/[^\s]+$/i.test(u) ? u.slice(0, 500) : '';
+  return { to: str(d.to, 80), from: str(d.from, 80), occ: str(d.occ, 40), msg: str(d.msg, 3000), music: url(str(d.music, 500)), date: /^\d{4}-\d{2}-\d{2}$/.test(d.date) ? d.date : '', dlabel: str(d.dlabel, 80), theme: THEMES.includes(d.theme) ? d.theme : 'rose', color: /^#[0-9a-fA-F]{6}$/.test(d.color) ? d.color : '', imgs, disabled: !!d.disabled };
+}
+const tokOK = t => /^[0-9a-f]{32}$/.test(t);
 
-const defaults = {
-  settings: {
-    storeName: 'FOR YOU | متجر هدايا',
-    tagline: 'تابعونا راح تحتاجونا 💗 | هدايا وتوزيعات كيوت',
-    deliveryBanner: 'توصيل محافظات العراق 5 آلاف 🚕 خلال 48 ساعة | اللهم صل على محمد 🌸',
-    instagram: 'foryou_astore',
-    closetInstagram: 'foryou_closet1',
-    telegram: 't.me/foryou_astore',
-    deliveryFee: 5000,
-    zainCash: '07801234567',
-    mastercard: '8821 **** **** 6049',
-    logo: '',
-    heroImage: '',
-    showPrices: true,
-    asiaBalance: true,
-    badge: '✨ تشكيلة الموسم الوردية الجديدة',
-    bannerTitle: 'أجمل الهدايا والبوكسات الكيوت نصنعها بحب خصيصاً لك',
-    bannerText: 'بوكسات هياو كيوت، باقات، دبابيس، تراكات وشوية وعطور أصلية بتغليف يأخذ القلب.',
-    categories: [
-      { id: 'cat-box', name: 'بوكسات 🎁' },
-      { id: 'cat-bags', name: 'باقات 💐' },
-      { id: 'cat-tracks', name: 'التراكات 🎀' },
-      { id: 'cat-perfume', name: 'عطور وعناية 💄' }
-    ],
-    extras: [
-      { id: 'ex-1', name: 'بوكس كيوت وردي مع شريط ستان 🎀', price: 3000 },
-      { id: 'ex-2', name: 'تغليف بلورة شفافة مع إضاءة LED ✨', price: 5000 },
-      { id: 'ex-3', name: 'علاكة هدايا فور يو مع بطاقة إهداء 💗', price: 1500 }
-    ]
-  },
-  users: [],
-  products: [],
-  orders: [],
-  expenses: [],
-  materials: [],
-  counters: { order: 1042, product: 1, expense: 1, material: 1, user: 1 },
-  sessions: {}
-};
-
-function loadDB() {
-  if (!fs.existsSync(DB_FILE)) {
-    const db = structuredClone(defaults);
-    const salt = crypto.randomBytes(16).toString('hex');
-    db.users.push({
-      id: 'u-owner-1', name: 'المدير العام', username: 'admin123',
-      role: 'owner', salt, hash: scryptHash('Aa2323@@', salt),
-      mustChangePassword: true, salary: 0, commission: 0, active: true,
-      createdAt: new Date().toISOString()
-    });
-    atomicWrite(DB_FILE, JSON.stringify(db, null, 2));
-    return db;
-  }
-  try {
-    const db = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
-    for (const k of Object.keys(defaults)) if (db[k] === undefined) db[k] = structuredClone(defaults[k]);
-    return db;
-  } catch {
-    throw new Error('store.json is invalid; restore a backup before restarting.');
-  }
-}
-function atomicWrite(file, content) {
-  const tmp = file + '.tmp-' + crypto.randomBytes(6).toString('hex');
-  fs.writeFileSync(tmp, content, { mode: 0o600 });
-  fs.renameSync(tmp, file);
-}
-let db = loadDB();
-function save() { atomicWrite(DB_FILE, JSON.stringify(db, null, 2)); }
-function scryptHash(password, salt) {
-  return crypto.scryptSync(password, salt, 64).toString('hex');
-}
-function safeEqual(a, b) {
-  try { return crypto.timingSafeEqual(Buffer.from(a, 'hex'), Buffer.from(b, 'hex')); }
-  catch { return false; }
-}
-function id(prefix='id') { return prefix + '-' + crypto.randomBytes(9).toString('base64url'); }
-function code() { return `FY-${db.counters.order}-${crypto.randomBytes(2).toString('hex').toUpperCase()}${crypto.randomBytes(1).toString('hex').toUpperCase()}`; }
-function json(res, status, data) {
-  const body = JSON.stringify(data);
-  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
-  res.end(body);
-}
-function text(res, status, body, type='text/plain; charset=utf-8') {
-  res.writeHead(status, { 'Content-Type': type, 'Cache-Control': 'no-store' }); res.end(body);
-}
-function cookieOptions() { return `Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_TTL/1000}${process.env.NODE_ENV === 'production' ? '; Secure' : ''}`; }
-function parseCookies(req) {
-  const out = {};
-  for (const part of (req.headers.cookie || '').split(';')) {
-    const i = part.indexOf('='); if (i > -1) out[part.slice(0,i).trim()] = decodeURIComponent(part.slice(i+1).trim());
-  }
-  return out;
-}
-function currentUser(req) {
-  const token = parseCookies(req)[COOKIE];
-  const s = token && db.sessions[token];
-  if (!s || s.expires < Date.now()) { if (s) delete db.sessions[token]; return null; }
-  const u = db.users.find(x => x.id === s.userId && x.active);
-  return u || null;
-}
-function requireRole(req, res, roles) {
-  const user = currentUser(req);
-  if (!user) { json(res, 401, { error: 'سجّل الدخول أولاً' }); return null; }
-  if (!roles.includes(user.role)) { json(res, 403, { error: 'ما عندك صلاحية لهذه الصفحة' }); return null; }
-  return user;
-}
-function rateLimit(req, res) {
-  const ip = req.socket.remoteAddress || 'unknown';
-  const key = ip + ':' + (req.url.startsWith('/api/login') ? 'login' : 'api');
-  const now = Date.now(), entry = rateMap.get(key) || { start: now, count: 0 };
-  if (now - entry.start > 60_000) { entry.start = now; entry.count = 0; }
-  entry.count++; rateMap.set(key, entry);
-  const limit = key.endsWith(':login') ? 8 : 180;
-  if (entry.count > limit) { json(res, 429, { error: 'محاولات كثيرة، انتظر دقيقة' }); return false; }
-  return true;
-}
-function readBody(req) {
-  return new Promise((resolve, reject) => {
-    let data = ''; req.on('data', chunk => {
-      data += chunk;
-      if (Buffer.byteLength(data) > MAX_BODY) { reject(Object.assign(new Error('حجم الطلب كبير'), { status: 413 })); req.destroy(); }
-    });
-    req.on('end', () => {
-      if (!data) return resolve({});
-      try { resolve(JSON.parse(data)); } catch { reject(Object.assign(new Error('JSON غير صالح'), { status: 400 })); }
-    });
-    req.on('error', reject);
+/* ---------- ملفات ثابتة ---------- */
+const cache = new Map();
+function serveFile(req, res, file) {
+  fs.stat(file, (e, st) => {
+    if (e || !st.isFile()) return send(res, 404, 'Not found', { 'Content-Type': 'text/plain; charset=utf-8' });
+    const ext = path.extname(file).toLowerCase(), html = ext === '.html';
+    const h = { 'Content-Type': MIME[ext] || 'application/octet-stream', 'Cache-Control': html ? 'no-cache' : 'public, max-age=86400' };
+    if (html) h['Content-Security-Policy'] = CSP;
+    const gz = /\bgzip\b/.test(req.headers['accept-encoding'] || '') && /^(\.html|\.js|\.css|\.json|\.svg)$/.test(ext);
+    if (!gz) { h['Content-Length'] = st.size; res.writeHead(200, Object.assign({ 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'same-origin', 'X-Frame-Options': 'DENY' }, h)); return fs.createReadStream(file).pipe(res); }
+    const k = file + st.mtimeMs, c = cache.get(k);
+    const out = buf => { h['Content-Encoding'] = 'gzip'; h['Vary'] = 'Accept-Encoding'; send(res, 200, buf, h); };
+    if (c) return out(c);
+    fs.readFile(file, (e2, b) => { if (e2) return send(res, 500, 'err'); const z = zlib.gzipSync(b); cache.set(k, z); out(z); });
   });
 }
-function cleanUser(u) {
-  return { id:u.id, name:u.name, username:u.username, role:u.role, salary:u.salary||0, commission:u.commission||0, active:u.active, mustChangePassword:!!u.mustChangePassword };
-}
-function publicProduct(p) {
-  const settings = db.settings;
-  return { ...p, wholesale: undefined, cost: undefined, price: settings.showPrices ? p.price : null };
-}
-function stageLabel(stage) {
-  return ({uploaded:'تم الرفع', prepared:'تم التجهيز', courier:'عند شركة التوصيل', delivered:'تم التسليم', cancelled:'ملغي'})[stage] || stage;
-}
-function dateWithin(date, from, to) {
-  const t = new Date(date).getTime(); return (!from || t >= new Date(from).getTime()) && (!to || t <= new Date(to+'T23:59:59').getTime());
-}
-function serveStatic(req, res) {
-  const pathname = decodeURIComponent(new URL(req.url, 'http://localhost').pathname);
-  const routes = {'/':'index.html','/index.html':'index.html','/login':'login.html','/login.html':'login.html','/dashboard':'dashboard.html','/dashboard.html':'dashboard.html'};
-  const file = routes[pathname] || (pathname.startsWith('/uploads/') ? path.join(UPLOAD_DIR, path.basename(pathname)) : null);
-  if (!file) return text(res,404,'Not found');
-  const full = path.isAbsolute(file) ? file : path.join(__dirname, file);
-  if (!full.startsWith(path.resolve(__dirname)) && !full.startsWith(path.resolve(UPLOAD_DIR))) return text(res,403,'Forbidden');
-  if (!fs.existsSync(full)) return text(res,404,'Not found');
-  const ext = path.extname(full).toLowerCase();
-  const types = {'.html':'text/html; charset=utf-8','.css':'text/css; charset=utf-8','.js':'text/javascript; charset=utf-8','.png':'image/png','.jpg':'image/jpeg','.jpeg':'image/jpeg','.webp':'image/webp','.svg':'image/svg+xml'};
-  res.writeHead(200, {'Content-Type':types[ext]||'application/octet-stream','X-Content-Type-Options':'nosniff','Cache-Control': ext === '.html' ? 'no-store' : 'public, max-age=3600'});
-  fs.createReadStream(full).pipe(res);
-}
-async function handle(req,res) {
-  if (!rateLimit(req,res)) return;
-  const url = new URL(req.url, 'http://localhost');
-  const p = url.pathname;
-  if (req.method === 'GET' && !p.startsWith('/api/')) return serveStatic(req,res);
-  if (req.method === 'GET' && p === '/api/public') {
-    return json(res,200,{settings:db.settings,products:db.products.filter(x=>x.active!==false).map(publicProduct),categories:db.settings.categories,extras:db.settings.extras});
-  }
-  if (req.method === 'POST' && p === '/api/login') {
-    const body = await readBody(req);
-    const username = String(body.username||'').trim().toLowerCase(), password = String(body.password||'');
-    const user = db.users.find(x=>x.username.toLowerCase()===username && x.active);
-    if (!user || !safeEqual(scryptHash(password,user.salt),user.hash)) return json(res,401,{error:'اسم المستخدم أو كلمة المرور غير صحيحة'});
-    const token = crypto.randomBytes(32).toString('base64url');
-    db.sessions[token] = { userId:user.id, expires:Date.now()+SESSION_TTL };
-    save();
-    res.writeHead(200,{'Set-Cookie':`${COOKIE}=${encodeURIComponent(token)}; ${cookieOptions()}`,'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'});
-    return res.end(JSON.stringify({user:cleanUser(user),redirect:'/dashboard.html'}));
-  }
-  if (req.method === 'POST' && p === '/api/logout') {
-    const token = parseCookies(req)[COOKIE]; if (token) delete db.sessions[token]; save();
-    res.writeHead(200,{'Set-Cookie':`${COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`,'Content-Type':'application/json'}); return res.end('{"ok":true}');
-  }
-  if (req.method === 'GET' && p === '/api/me') {
-    const u=currentUser(req); return u ? json(res,200,{user:cleanUser(u)}) : json(res,401,{error:'غير مسجل'});
-  }
-  if (req.method === 'GET' && p === '/api/track') {
-    const track=String(url.searchParams.get('code')||'').trim().toUpperCase();
-    const o=db.orders.find(x=>x.trackCode===track);
-    return o ? json(res,200,{code:o.trackCode,stage:o.stage,stageLabel:stageLabel(o.stage),createdAt:o.createdAt,customerName:o.customerName}) : json(res,404,{error:'ما لقينا طلب بهذا الكود'});
-  }
-  if (req.method === 'POST' && p === '/api/orders') {
-    const body=await readBody(req);
-    const items=Array.isArray(body.items)?body.items:[];
-    if (!items.length) return json(res,400,{error:'السلة فارغة'});
-    const snapshots=[];
-    for(const line of items){
-      const product=db.products.find(x=>x.id===line.productId && x.active!==false);
-      const qty=Math.max(1,Math.min(99,Number(line.qty)||1));
-      if(!product) return json(res,400,{error:'منتج غير موجود'});
-      if(product.stock < qty) return json(res,409,{error:`الكمية غير متوفرة: ${product.name}`});
-      snapshots.push({productId:product.id,name:product.name,qty,price:Number(product.price||0),cost:Number(product.cost||product.wholesale||0),image:product.image||''});
+
+http.createServer(async (req, res) => {
+  const ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+  let u; try { u = new URL(req.url, 'http://x'); } catch (e) { return send(res, 400, { error: 'bad url' }); }
+  const p = decodeURIComponent(u.pathname);
+  try {
+    if (p === '/api/health') return send(res, 200, { ok: true, time: new Date().toISOString() });
+    if (p === '/api/status') return send(res, 200, { ok: true, publishEnabled: !!PUBLISH_KEY, persistent });
+    if (p === '/api/check-key' && req.method === 'POST') {
+      if (!PUBLISH_KEY) return send(res, 503, { error: 'publish disabled' });
+      if (limited(ip, 'k', 15)) return send(res, 429, { error: 'slow down' });
+      return authed(req) ? send(res, 200, { ok: true }) : send(res, 401, { error: 'bad key' });
     }
-    const extras=(Array.isArray(body.extras)?body.extras:[]).map(x=>db.settings.extras.find(e=>e.id===x)).filter(Boolean).map(x=>({...x}));
-    const subtotal=snapshots.reduce((a,x)=>a+x*x.qty,0), extraTotal=extras.reduce((a,x)=>a+Number(x.price||0),0);
-    const order={id:id('ord'),trackCode:code(),customerName:String(body.customerName||'').slice(0,100),phone:String(body.phone||'').slice(0,30),governorate:String(body.governorate||'').slice(0,60),address:String(body.address||'').slice(0,300),note:String(body.note||'').slice(0,500),items:snapshots,extras,subtotal,extraTotal,total:subtotal+extraTotal,deliveryFee:Number(db.settings.deliveryFee||0),stage:'uploaded',createdAt:new Date().toISOString(),cancelledAt:null};
-    db.counters.order++;
-    for(const line of snapshots){const product=db.products.find(x=>x.id===line.productId);product.stock-=line.qty;}
-    db.orders.unshift(order); save();
-    return json(res,201,{order:{trackCode:order.trackCode,total:order.total,stage:order.stage},message:orderMessage(order)});
-  }
-  if (req.method === 'GET' && p === '/api/admin/data') {
-    const user=requireRole(req,res,['owner','admin','supplier']); if(!user)return;
-    const safeOrders=db.orders.map(o=> user.role==='supplier' ? {...o,items:o.items.map(i=>({...i,cost:undefined,wholesale:undefined})),subtotal:undefined,extraTotal:undefined} : o);
-    return json(res,200,{user:cleanUser(user),settings:db.settings,products:user.role==='supplier'?db.products.map(x=>({...x,cost:undefined,wholesale:undefined})):db.products,orders:safeOrders,users:user.role==='owner'?db.users.map(cleanUser):[],expenses:user.role==='owner'?db.expenses:[],materials:user.role==='owner'?db.materials:[]});
-  }
-  if (req.method === 'POST' && p === '/api/admin/settings') {
-    const user=requireRole(req,res,['owner']);if(!user)return; const b=await readBody(req);
-    const allowed=['storeName','tagline','deliveryBanner','instagram','closetInstagram','telegram','deliveryFee','zainCash','mastercard','logo','heroImage','showPrices','asiaBalance','badge','bannerTitle','bannerText'];
-    for(const k of allowed) if(b[k]!==undefined) db.settings[k]=b[k];
-    if(Array.isArray(b.categories)) db.settings.categories=b.categories.slice(0,30).map(x=>({id:String(x.id||id('cat')),name:String(x.name||'').slice(0,60)}));
-    if(Array.isArray(b.extras)) db.settings.extras=b.extras.slice(0,50).map(x=>({id:String(x.id||id('ex')),name:String(x.name||'').slice(0,100),price:Math.max(0,Number(x.price)||0)}));
-    save();return json(res,200,{ok:true});
-  }
-  if (req.method === 'POST' && p === '/api/admin/products') {
-    const user=requireRole(req,res,['owner','admin']);if(!user)return;const b=await readBody(req);
-    const product={id:id('prd'),name:String(b.name||'').slice(0,120),category:String(b.category||'').slice(0,80),price:Math.max(0,Number(b.price)||0),cost:user.role==='owner'?Math.max(0,Number(b.cost)||0):0,stock:Math.max(0,Math.floor(Number(b.stock)||0)),sizes:String(b.sizes||'').slice(0,120),description:String(b.description||'').slice(0,500),image:String(b.image||'').slice(0,500),active:true,createdAt:new Date().toISOString()};
-    if(!product.name)return json(res,400,{error:'اسم المنتج مطلوب'});
-    db.products.unshift(product);db.counters.product++;save();return json(res,201,{product});
-  }
-  if (req.method === 'PATCH' && p.startsWith('/api/admin/products/')) {
-    const user=requireRole(req,res,['owner','admin']);if(!user)return;const pid=p.split('/').pop(),b=await readBody(req),x=db.products.find(v=>v.id===pid);if(!x)return json(res,404,{error:'المنتج غير موجود'});
-    for(const k of ['name','category','price','stock','sizes','description','image','active']) if(b[k]!==undefined)x[k]=k==='price'||k==='stock'?Math.max(0,Number(b[k])||0):b[k];
-    if(user.role==='owner'&&b.cost!==undefined)x.cost=Math.max(0,Number(b.cost)||0);save();return json(res,200,{product:x});
-  }
-  if (req.method === 'DELETE' && p.startsWith('/api/admin/products/')) {
-    const user=requireRole(req,res,['owner','admin']);if(!user)return;const pid=p.split('/').pop();db.products=db.products.filter(x=>x.id!==pid);save();return json(res,200,{ok:true});
-  }
-  if (req.method === 'PATCH' && p.startsWith('/api/admin/orders/')) {
-    const user=requireRole(req,res,['owner','admin','supplier']);if(!user)return;const oid=p.split('/').pop(),b=await readBody(req),o=db.orders.find(x=>x.id===oid);if(!o)return json(res,404,{error:'الطلب غير موجود'});
-    const next=String(b.stage||o.stage);if(!['uploaded','prepared','courier','delivered','cancelled'].includes(next))return json(res,400,{error:'حالة غير صحيحة'});
-    if(next==='cancelled'&&o.stage!=='cancelled'){for(const line of o.items){const pr=db.products.find(x=>x.id===line.productId);if(pr)pr.stock+=line.qty;}o.cancelledAt=new Date().toISOString();}
-    if(next!=='cancelled'&&o.stage==='cancelled')return json(res,409,{error:'لا يمكن إعادة الطلب الملغي إلى مسار التجهيز'});
-    o.stage=next;o.updatedAt=new Date().toISOString();save();return json(res,200,{order:o});
-  }
-  if (req.method === 'POST' && p === '/api/admin/users') {
-    const user=requireRole(req,res,['owner']);if(!user)return;const b=await readBody(req),username=String(b.username||'').trim().toLowerCase(),password=String(b.password||'');
-    if(!username||password.length<8||!['admin','supplier'].includes(b.role))return json(res,400,{error:'اسم المستخدم وكلمة مرور 8 أحرف ودور صحيح مطلوبة'});
-    if(db.users.some(x=>x.username.toLowerCase()===username))return json(res,409,{error:'اسم المستخدم موجود'});
-    const salt=crypto.randomBytes(16).toString('hex'),u={id:id('usr'),name:String(b.name||username).slice(0,80),username,role:b.role,salt,hash:scryptHash(password,salt),mustChangePassword:!!b.mustChangePassword,salary:Math.max(0,Number(b.salary)||0),commission:Math.max(0,Number(b.commission)||0),active:true,createdAt:new Date().toISOString()};
-    db.users.push(u);db.counters.user++;save();return json(res,201,{user:cleanUser(u)});
-  }
-  if (req.method === 'PATCH' && p.startsWith('/api/admin/users/')) {
-    const user=requireRole(req,res,['owner']);if(!user)return;const uid=p.split('/').pop(),b=await readBody(req),u=db.users.find(x=>x.id===uid);if(!u)return json(res,404,{error:'المستخدم غير موجود'});
-    if(b.active!==undefined)u.active=!!b.active;if(b.salary!==undefined)u.salary=Math.max(0,Number(b.salary)||0);if(b.commission!==undefined)u.commission=Math.max(0,Number(b.commission)||0);
-    if(b.password){if(String(b.password).length<8)return json(res,400,{error:'كلمة المرور 8 أحرف على الأقل'});u.salt=crypto.randomBytes(16).toString('hex');u.hash=scryptHash(String(b.password),u.salt);u.mustChangePassword=!!b.mustChangePassword;}
-    save();return json(res,200,{user:cleanUser(u)});
-  }
-  if (req.method === 'POST' && p === '/api/admin/expenses') {
-    const user=requireRole(req,res,['owner']);if(!user)return;const b=await readBody(req),e={id:id('exp'),description:String(b.description||'').slice(0,160),category:String(b.category||'misc'),amount:Math.max(0,Number(b.amount)||0),date:String(b.date||new Date().toISOString().slice(0,10)),createdBy:user.id};if(!e.description||!e.amount)return json(res,400,{error:'الوصف والمبلغ مطلوبان'});db.expenses.unshift(e);db.counters.expense++;save();return json(res,201,{expense:e});
-  }
-  if (req.method === 'POST' && p === '/api/admin/materials') {
-    const user=requireRole(req,res,['owner','admin']);if(!user)return;const b=await readBody(req),m={id:id('mat'),name:String(b.name||'').slice(0,100),qty:Math.max(0,Number(b.qty)||0),threshold:Math.max(0,Number(b.threshold)||0),unit:String(b.unit||'قطعة')};if(!m.name)return json(res,400,{error:'اسم المادة مطلوب'});db.materials.unshift(m);db.counters.material++;save();return json(res,201,{material:m});
-  }
-  if (req.method === 'PATCH' && p.startsWith('/api/admin/materials/')) {
-    const user=requireRole(req,res,['owner','admin']);if(!user)return;const mid=p.split('/').pop(),b=await readBody(req),m=db.materials.find(x=>x.id===mid);if(!m)return json(res,404,{error:'المادة غير موجودة'});if(b.qty!==undefined)m.qty=Math.max(0,Number(b.qty)||0);if(b.threshold!==undefined)m.threshold=Math.max(0,Number(b.threshold)||0);save();return json(res,200,{material:m});
-  }
-  return json(res,404,{error:'المسار غير موجود'});
-}
-const server=http.createServer((req,res)=>{handle(req,res).catch(err=>{if(!res.headersSent)json(res,err.status||500,{error:err.status?err.message:'حدث خطأ داخلي'});else res.destroy();});});
-server.listen(PORT,'0.0.0.0',()=>console.log(`FOR YOU running on ${PORT}; DATA_DIR=${DATA_DIR}`));
+    const m = p.match(/^\/api\/greetings\/([^/]+)$/);
+    if (m) {
+      const tok = m[1];
+      if (!tokOK(tok)) return send(res, 404, { error: 'not found' });
+      if (req.method === 'GET') {
+        if (limited(ip, 'g', 120)) return send(res, 429, { error: 'slow down' });
+        const g = store[tok];
+        return g ? send(res, 200, { data: g }, { 'X-Robots-Tag': 'noindex' }) : send(res, 404, { error: 'not found' });
+      }
+      if (req.method === 'PUT' || req.method === 'DELETE') {
+        if (!PUBLISH_KEY) return send(res, 503, { error: 'publish disabled' });
+        if (limited(ip, 'w', 60)) return send(res, 429, { error: 'slow down' });
+        if (!authed(req)) return send(res, 401, { error: 'bad key' });
+        if (req.method === 'DELETE') { delete store[tok]; save(); return send(res, 200, { ok: true }); }
+        let body; try { body = JSON.parse(await readBody(req, 6 * 1024 * 1024)); } catch (e) { return send(res, e.code === 413 ? 413 : 400, { error: e.code === 413 ? 'too large' : 'bad json' }); }
+        const d = clean(body && body.data);
+        if (!d || !d.to) return send(res, 400, { error: 'invalid data' });
+        if (!store[tok] && Object.keys(store).length >= 5000) return send(res, 507, { error: 'storage full' });
+        store[tok] = d; save();
+        return send(res, 200, { ok: true });
+      }
+      return send(res, 405, { error: 'method' });
+    }
+    if (p.startsWith('/api/')) return send(res, 404, { error: 'not found' });
+    if (req.method !== 'GET' && req.method !== 'HEAD') return send(res, 405, 'Method not allowed');
+    let f = path.normalize(path.join(PUB, p));
+    if (!f.startsWith(PUB)) return send(res, 403, 'Forbidden');
+    if (p.endsWith('/') || !path.extname(p)) f = path.join(PUB, 'index.html');
+    serveFile(req, res, f);
+  } catch (e) { console.error(e); if (!res.headersSent) send(res, 500, { error: 'server error' }); }
+}).listen(PORT, '0.0.0.0', () => console.log('FOR YOU listening on ' + PORT + (PUBLISH_KEY ? ' (publish enabled)' : ' (PUBLISH_KEY not set)') + ' data=' + DATA_DIR));

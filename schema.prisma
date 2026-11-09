@@ -1,0 +1,329 @@
+// مخطط قاعدة البيانات الكامل (المرحلة 2). غير موصول بالخادم بعد وغير مختبر بـ prisma validate.
+// المبالغ كلها أعداد صحيحة بالدينار العراقي (Int) لتجنب أخطاء الفاصلة العائمة.
+generator client { provider = "prisma-client-js" }
+datasource db { provider = "postgresql"
+  url = env("DATABASE_URL") }
+
+enum OrderStatus { PENDING_CONFIRMATION CONFIRMED WAITING_FOR_PREPARATION PREPARING PREPARED HANDED_TO_DELIVERY DELIVERED CANCELLED RETURNED }
+enum PaymentStatus { PENDING PROOF_UPLOADED UNDER_REVIEW PAID REJECTED REFUNDED }
+enum InvType { ADD DEDUCT DAMAGED ADJUST RESERVE RELEASE SALE RETURN PURCHASE }
+enum GreetingStatus { NEW IN_PROGRESS WAITING_CUSTOMER COMPLETED CANCELLED }
+enum CommissionKind { FIXED PERCENT }
+enum CommissionWhen { PREPARED DELIVERED }
+
+model Role { id Int @id @default(autoincrement())
+  name String @unique
+  permissions Permission[]
+  users User[] }
+model Permission { id Int @id @default(autoincrement())
+  key String @unique
+  roles Role[] }
+model User { id Int @id @default(autoincrement())
+  username String @unique
+  passwordHash String
+  name String
+  active Boolean @default(true)
+  roleId Int
+  role Role @relation(fields: [roleId], references: [id])
+  canGreetings Boolean @default(false)
+  allowedStatuses OrderStatus[]
+  createdAt DateTime @default(now())
+  ordersCreated Order[] @relation("OrderAdmin")
+  ordersPrepared Order[] @relation("OrderPrep")
+  salaries EmployeeSalary[]
+  commissions EmployeeCommission[]
+  payments EmployeePayment[]
+  history OrderStatusHistory[]
+  invTx InventoryTransaction[]
+  audits AuditLog[]
+  greetReqs GreetingRequest[] }
+
+model Customer { id Int @id @default(autoincrement())
+  name String
+  phone String
+  phone2 String?
+  createdAt DateTime @default(now())
+  orders Order[]
+  @@index([phone]) }
+
+model Category { id Int @id @default(autoincrement())
+  name String
+  description String?
+  imageUrl String?
+  sortOrder Int @default(0)
+  active Boolean @default(true)
+  products Product[]
+  sections HomepageSection[] }
+model Product { id Int @id @default(autoincrement())
+  name String
+  description String?
+  mainImage String?
+  extraImages String[]
+  price Int
+  wholesaleCost Int @default(0)
+  extraCost Int @default(0)
+  categoryId Int?
+  category Category? @relation(fields: [categoryId], references: [id])
+  status String @default("ACTIVE")
+  featured Boolean @default(false)
+  bestSeller Boolean @default(false)
+  customName Boolean @default(true)
+  customText Boolean @default(true)
+  customImage Boolean @default(false)
+  createdAt DateTime @default(now())
+  variants ProductVariant[]
+  inventory Inventory[]
+  items OrderItem[]
+  packaging PackagingOption[]
+  @@index([status]) }
+model ProductVariant { id Int @id @default(autoincrement())
+  productId Int
+  product Product @relation(fields: [productId], references: [id])
+  name String
+  color String?
+  size String?
+  sku String? @unique
+  priceAdjust Int @default(0)
+  active Boolean @default(true)
+  inventory Inventory[]
+  items OrderItem[] }
+model Inventory { id Int @id @default(autoincrement())
+  productId Int
+  product Product @relation(fields: [productId], references: [id])
+  variantId Int?
+  variant ProductVariant? @relation(fields: [variantId], references: [id])
+  onHand Int @default(0)
+  reserved Int @default(0)
+  transactions InventoryTransaction[]
+  @@unique([productId, variantId]) }
+model InventoryTransaction { id Int @id @default(autoincrement())
+  inventoryId Int
+  inventory Inventory @relation(fields: [inventoryId], references: [id])
+  type InvType
+  quantity Int
+  reason String?
+  note String?
+  userId Int?
+  user User? @relation(fields: [userId], references: [id])
+  orderId Int?
+  order Order? @relation(fields: [orderId], references: [id])
+  purchaseInvoiceId Int?
+  purchaseInvoice PurchaseInvoice? @relation(fields: [purchaseInvoiceId], references: [id])
+  createdAt DateTime @default(now()) }
+model PurchaseInvoice { id Int @id @default(autoincrement())
+  supplier String
+  note String?
+  createdAt DateTime @default(now())
+  items PurchaseInvoiceItem[]
+  transactions InventoryTransaction[] }
+model PurchaseInvoiceItem { id Int @id @default(autoincrement())
+  invoiceId Int
+  invoice PurchaseInvoice @relation(fields: [invoiceId], references: [id])
+  productId Int
+  variantId Int?
+  quantity Int
+  unitCost Int }
+
+model HomepageSection { id Int @id @default(autoincrement())
+  title String
+  kind String
+  categoryId Int?
+  category Category? @relation(fields: [categoryId], references: [id])
+  bgColor String @default("#FFF0F6")
+  itemCount Int @default(4)
+  visible Boolean @default(true)
+  sortOrder Int @default(0) }
+model HomepageBanner { id Int @id @default(autoincrement())
+  title String?
+  description String?
+  imageUrl String?
+  sortOrder Int @default(0)
+  active Boolean @default(true) }
+model Faq { id Int @id @default(autoincrement())
+  question String
+  answer String
+  sortOrder Int @default(0)
+  active Boolean @default(true) }
+
+model Order { id Int @id @default(autoincrement())
+  reference String @unique
+  customerId Int
+  customer Customer @relation(fields: [customerId], references: [id])
+  governorate String
+  address String?
+  customerNote String?
+  internalNote String?
+  status OrderStatus @default(PENDING_CONFIRMATION)
+  source String @default("STORE")
+  subtotal Int
+  packagingTotal Int @default(0)
+  deliveryTotal Int @default(0)
+  feeTotal Int @default(0)
+  total Int
+  stockReserved Boolean @default(false)
+  adminId Int?
+  admin User? @relation("OrderAdmin", fields: [adminId], references: [id])
+  prepId Int?
+  prep User? @relation("OrderPrep", fields: [prepId], references: [id])
+  paymentMethodId Int?
+  paymentMethod PaymentMethod? @relation(fields: [paymentMethodId], references: [id])
+  lossAmount Int @default(0)
+  returnReason String?
+  createdAt DateTime @default(now())
+  items OrderItem[]
+  history OrderStatusHistory[]
+  payments Payment[]
+  commissions EmployeeCommission[]
+  transactions InventoryTransaction[]
+  greetings GreetingPage[]
+  @@index([status])
+  @@index([createdAt]) }
+model OrderItem { id Int @id @default(autoincrement())
+  orderId Int
+  order Order @relation(fields: [orderId], references: [id])
+  productId Int
+  product Product @relation(fields: [productId], references: [id])
+  variantId Int?
+  variant ProductVariant? @relation(fields: [variantId], references: [id])
+  quantity Int
+  unitPrice Int
+  color String?
+  size String?
+  packagingIds Int[]
+  customization OrderCustomization? }
+model OrderCustomization { id Int @id @default(autoincrement())
+  itemId Int @unique
+  item OrderItem @relation(fields: [itemId], references: [id])
+  recipientName String?
+  text String?
+  imageUrl String?
+  extra String? }
+model OrderStatusHistory { id Int @id @default(autoincrement())
+  orderId Int
+  order Order @relation(fields: [orderId], references: [id])
+  status OrderStatus
+  note String?
+  userId Int?
+  user User? @relation(fields: [userId], references: [id])
+  createdAt DateTime @default(now()) }
+
+model PaymentMethod { id Int @id @default(autoincrement())
+  name String
+  holder String?
+  accountNumber String?
+  instructions String?
+  fee Int @default(0)
+  active Boolean @default(true)
+  sortOrder Int @default(0)
+  orders Order[]
+  payments Payment[] }
+model Payment { id Int @id @default(autoincrement())
+  orderId Int
+  order Order @relation(fields: [orderId], references: [id])
+  methodId Int
+  method PaymentMethod @relation(fields: [methodId], references: [id])
+  amount Int
+  status PaymentStatus @default(PENDING)
+  proofUrl String?
+  createdAt DateTime @default(now()) }
+model PackagingOption { id Int @id @default(autoincrement())
+  name String
+  price Int
+  imageUrl String?
+  active Boolean @default(true)
+  products Product[] }
+model DeliverySetting { id Int @id @default(autoincrement())
+  governorate String @unique
+  price Int
+  freeDelivery Boolean @default(false)
+  available Boolean @default(true)
+  company String?
+  note String? }
+
+model ExpenseCategory { id Int @id @default(autoincrement())
+  name String @unique
+  expenses Expense[] }
+model Expense { id Int @id @default(autoincrement())
+  categoryId Int
+  category ExpenseCategory @relation(fields: [categoryId], references: [id])
+  description String
+  amount Int
+  paymentMethod String?
+  receiptUrl String?
+  note String?
+  auto Boolean @default(false)
+  createdAt DateTime @default(now())
+  @@index([createdAt]) }
+model EmployeeSalary { id Int @id @default(autoincrement())
+  userId Int
+  user User @relation(fields: [userId], references: [id])
+  amount Int
+  commissionKind CommissionKind @default(FIXED)
+  commissionValue Int @default(0)
+  commissionWhen CommissionWhen @default(PREPARED)
+  since DateTime @default(now()) }
+model EmployeeCommission { id Int @id @default(autoincrement())
+  userId Int
+  user User @relation(fields: [userId], references: [id])
+  orderId Int
+  order Order @relation(fields: [orderId], references: [id])
+  amount Int
+  reversed Boolean @default(false)
+  createdAt DateTime @default(now())
+  @@unique([userId, orderId]) }
+model EmployeePayment { id Int @id @default(autoincrement())
+  userId Int
+  user User @relation(fields: [userId], references: [id])
+  kind String
+  amount Int
+  createdAt DateTime @default(now()) }
+
+model GreetingTemplate { id Int @id @default(autoincrement())
+  name String
+  message String
+  pages GreetingPage[] }
+model GreetingRequest { id Int @id @default(autoincrement())
+  customerName String
+  phone String
+  occasion String
+  recipient String?
+  message String?
+  note String?
+  status GreetingStatus @default(NEW)
+  assigneeId Int?
+  assignee User? @relation(fields: [assigneeId], references: [id])
+  createdAt DateTime @default(now())
+  pages GreetingPage[] }
+model GreetingPage { id Int @id @default(autoincrement())
+  token String @unique
+  requestId Int?
+  request GreetingRequest? @relation(fields: [requestId], references: [id])
+  orderId Int?
+  order Order? @relation(fields: [orderId], references: [id])
+  templateId Int?
+  template GreetingTemplate? @relation(fields: [templateId], references: [id])
+  recipient String
+  sender String
+  occasion String
+  message String
+  musicUrl String?
+  eventDate DateTime?
+  color String @default("#F5A6C8")
+  disabled Boolean @default(false)
+  images GreetingImage[]
+  createdAt DateTime @default(now()) }
+model GreetingImage { id Int @id @default(autoincrement())
+  pageId Int
+  page GreetingPage @relation(fields: [pageId], references: [id])
+  url String }
+
+model SystemSetting { key String @id
+  value Json }
+model AuditLog { id Int @id @default(autoincrement())
+  userId Int?
+  user User? @relation(fields: [userId], references: [id])
+  action String
+  entity String?
+  entityId String?
+  detail Json?
+  createdAt DateTime @default(now()) }
